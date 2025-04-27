@@ -1,0 +1,9 @@
+{
+    "credentials_file": "credentials.json",
+    "project_id": "your-project-id",
+    "default_zone": "us-central1-a",
+    "listen_port": 8080,
+    "instance_name": "sigma-server",
+    "idle_timeout_seconds": 300
+}
+  
