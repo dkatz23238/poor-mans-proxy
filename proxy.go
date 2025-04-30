@@ -269,39 +269,50 @@ func (s *Server) checkIdleTimeout() {
 	defer ticker.Stop()
 
 	for {
-		<-ticker.C()
-		s.mu.RLock()
-		if s.state.Status != "RUNNING" {
+		select {
+		case <-ticker.C():
+			s.mu.RLock()
+			status := s.state.Status
+			ready := s.clock.Now().After(s.state.ReadyTime)
+			lastUsed := s.state.LastUsed
 			s.mu.RUnlock()
-			log.Printf("Instance not running, stopping idle timeout check")
-			return
-		}
 
-		// Only check idle time if we're past the startup grace period
-		// Use the same time comparison logic as ServeHTTP
-		if !s.clock.Now().After(s.state.ReadyTime) {
-			s.mu.RUnlock()
-			continue
-		}
-
-		idle := s.clock.Since(s.state.LastUsed)
-		s.mu.RUnlock()
-
-		log.Printf("Instance idle time: %v (timeout: %v)", idle, time.Duration(s.cfg.IdleTimeoutSeconds)*time.Second)
-		if idle > time.Duration(s.cfg.IdleTimeoutSeconds)*time.Second {
-			s.mu.Lock()
-			if s.state.Status == "RUNNING" {
-				log.Printf("Instance %s idle for %v, shutting down",
-					s.cfg.InstanceName, idle)
-				s.state.Status = "TERMINATED"
-				if err := s.api.Stop(context.Background(), s.cfg.ProjectID, s.cfg.DefaultZone, s.cfg.InstanceName); err != nil {
-					log.Printf("Failed to stop instance %s: %v", s.cfg.InstanceName, err)
-				} else {
-					log.Printf("Successfully stopped instance %s", s.cfg.InstanceName)
-				}
+			// Exit if instance is not running
+			if status != "RUNNING" {
+				log.Printf("Instance not running (status: %s), stopping idle timeout check", status)
+				return
 			}
-			s.mu.Unlock()
-			return
+
+			// Only check idle time if we're past the startup grace period
+			if !ready {
+				continue
+			}
+
+			// Calculate idle time outside the read lock
+			idle := s.clock.Since(lastUsed)
+			idleTimeout := time.Duration(s.cfg.IdleTimeoutSeconds) * time.Second
+
+			log.Printf("Instance idle time: %v (timeout: %v)", idle, idleTimeout)
+			if idle > idleTimeout {
+				s.mu.Lock()
+				// Double-check status after acquiring write lock to avoid race conditions
+				if s.state.Status == "RUNNING" {
+					log.Printf("Instance %s idle for %v, shutting down",
+						s.cfg.InstanceName, idle)
+					s.state.Status = "TERMINATED"
+					s.mu.Unlock()
+
+					// Stop the instance without holding the lock to avoid deadlocks
+					if err := s.api.Stop(context.Background(), s.cfg.ProjectID, s.cfg.DefaultZone, s.cfg.InstanceName); err != nil {
+						log.Printf("Failed to stop instance %s: %v", s.cfg.InstanceName, err)
+					} else {
+						log.Printf("Successfully stopped instance %s", s.cfg.InstanceName)
+					}
+				} else {
+					s.mu.Unlock()
+				}
+				return
+			}
 		}
 	}
 }

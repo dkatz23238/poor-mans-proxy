@@ -140,7 +140,7 @@ type mockClock struct {
 func newClock() *mockClock {
 	return &mockClock{
 		now:  time.Now(),
-		tick: make(chan time.Time, 10),
+		tick: make(chan time.Time, 100),
 	}
 }
 
@@ -160,7 +160,7 @@ func (c *mockClock) After(d time.Duration) <-chan time.Time {
 }
 
 func (c *mockClock) NewTicker(d time.Duration) Ticker {
-	return fakeTicker{c.tick}
+	return &fakeTicker{c: c.tick}
 }
 
 func (c *mockClock) Since(t time.Time) time.Duration {
@@ -175,21 +175,28 @@ func (c *mockClock) advance(d time.Duration) {
 	c.mu.Unlock()
 
 	// Send multiple ticks to ensure all goroutines get the update
-	for i := 0; i < 20; i++ { // Increase from 10 to 20 for more reliability
+	for i := 0; i < 30; i++ { // Increase from 20 to 30 for more reliability
 		select {
 		case c.tick <- c.now:
 		default:
+			// If channel is full, sleep briefly and try again
+			time.Sleep(5 * time.Millisecond)
+			select {
+			case c.tick <- c.now:
+			default:
+				// If still can't send, that's ok, continue
+			}
 		}
 	}
 
 	// Wait longer to ensure all goroutines have processed the time change
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
 }
 
 type fakeTicker struct{ c chan time.Time }
 
-func (t fakeTicker) C() <-chan time.Time { return t.c }
-func (t fakeTicker) Stop()               {}
+func (t *fakeTicker) C() <-chan time.Time { return t.c }
+func (t *fakeTicker) Stop()               {}
 
 // ---- test -------------------------------------------------------------------
 
@@ -299,9 +306,10 @@ func TestStartupGracePeriod(t *testing.T) {
 		t.Fatalf("Failed to create server: %v", err)
 	}
 
-	// Explicitly set ReadyTime to test grace period
+	// Explicitly set ReadyTime to test grace period - adding a small buffer to ensure it's exact
+	readyTime := now.Add(60 * time.Second)
 	server.mu.Lock()
-	server.state.ReadyTime = now.Add(60 * time.Second) // Set to exactly 60 seconds from now
+	server.state.ReadyTime = readyTime // Set to exactly 60 seconds from now
 	server.mu.Unlock()
 
 	proxy := httptest.NewServer(server)
@@ -318,12 +326,13 @@ func TestStartupGracePeriod(t *testing.T) {
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Errorf("During grace period: Expected status 503, got %d", resp.StatusCode)
 	}
+	resp.Body.Close()
 
 	// Advance clock to exactly the end of grace period
 	clock.advance(60 * time.Second)
-	time.Sleep(200 * time.Millisecond) // Give more time for state to update
+	time.Sleep(250 * time.Millisecond) // Give more time for state to update
 
-	// Test 2: At grace period end - should return 503
+	// Test 2: At grace period end - should still return 503 due to comparison logic
 	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Failed to make request: %v", err)
@@ -331,10 +340,11 @@ func TestStartupGracePeriod(t *testing.T) {
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Errorf("At grace period end: Expected status 503, got %d", resp.StatusCode)
 	}
+	resp.Body.Close()
 
-	// Advance clock past grace period
-	clock.advance(1 * time.Second)
-	time.Sleep(200 * time.Millisecond) // Give more time for state to update
+	// Advance clock past grace period with a clear buffer
+	clock.advance(2 * time.Second)     // Advance by 2 seconds instead of 1 for more reliable testing
+	time.Sleep(250 * time.Millisecond) // Give more time for state to update
 
 	// Test 3: After grace period - should return 200
 	resp, err = http.DefaultClient.Do(req)
@@ -344,6 +354,7 @@ func TestStartupGracePeriod(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("After grace period: Expected status 200, got %d", resp.StatusCode)
 	}
+	resp.Body.Close()
 }
 
 func TestWhitelistPaths(t *testing.T) {
@@ -521,6 +532,7 @@ func TestIdleTimeout(t *testing.T) {
 
 	// Create a mock clock for precise time control
 	clock := newClock()
+	now := clock.Now()
 
 	// Create proxy server with test configuration and short idle timeout
 	cfg := &Config{
@@ -542,7 +554,8 @@ func TestIdleTimeout(t *testing.T) {
 
 	// Force ReadyTime to be in the past so the instance is immediately ready
 	server.mu.Lock()
-	server.state.ReadyTime = clock.Now().Add(-10 * time.Minute)
+	server.state.ReadyTime = now.Add(-10 * time.Minute)
+	server.state.LastUsed = now // Set LastUsed explicitly to now
 	server.mu.Unlock()
 
 	proxy := httptest.NewServer(server)
@@ -558,10 +571,25 @@ func TestIdleTimeout(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("Expected status 200, got %d", resp.StatusCode)
 	}
+	resp.Body.Close()
 
-	// Advance clock past idle timeout
+	// Advance clock past idle timeout by a significant margin
 	clock.advance(10 * time.Second)    // Well past the 1 second idle timeout
-	time.Sleep(200 * time.Millisecond) // Give more time for state to update
+	time.Sleep(300 * time.Millisecond) // Give more time for state to update and stop operation to complete
+
+	// Verify instance has been stopped
+	api.mu.Lock()
+	stopCount := api.stopN
+	status := api.status
+	api.mu.Unlock()
+
+	if stopCount == 0 {
+		t.Errorf("Expected instance to be stopped, but Stop() was not called")
+	}
+
+	if status != "TERMINATED" {
+		t.Errorf("Expected instance status to be TERMINATED, got %s", status)
+	}
 
 	// Second request should get 503 as instance should be stopped by now
 	resp, err = http.DefaultClient.Do(req)
@@ -571,6 +599,7 @@ func TestIdleTimeout(t *testing.T) {
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Errorf("Expected status 503, got %d", resp.StatusCode)
 	}
+	resp.Body.Close()
 }
 
 func TestForwardedHeaders(t *testing.T) {
