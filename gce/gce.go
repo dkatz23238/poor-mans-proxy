@@ -59,10 +59,8 @@ func (g *Client) Get(ctx context.Context, project, zone, instanceName string) (s
 	}
 
 	ip := ""
-	if len(instance.NetworkInterfaces) > 0 &&
-		len(instance.NetworkInterfaces[0].AccessConfigs) > 0 &&
-		instance.NetworkInterfaces[0].AccessConfigs[0].NatIP != nil {
-		ip = *instance.NetworkInterfaces[0].AccessConfigs[0].NatIP
+	if len(instance.NetworkInterfaces) > 0 && instance.NetworkInterfaces[0].NetworkIP != nil {
+		ip = *instance.NetworkInterfaces[0].NetworkIP
 	}
 
 	return status, ip, nil
