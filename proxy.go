@@ -92,11 +92,15 @@ type InstanceState struct {
 	Status    string
 	LastUsed  time.Time
 	StartTime time.Time
+	// ReadyTime tracks when the instance will be ready to accept traffic
+	ReadyTime time.Time
 }
 
 const (
 	RetryHeaderName  = "X-Retry-After"
 	RetryHeaderValue = "5"
+	// StartupGracePeriod is the time to wait after instance start before accepting traffic
+	StartupGracePeriod = 60 * time.Second
 )
 
 // NewServer creates a new proxy server
@@ -145,22 +149,29 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Received request for %s, instance state: %s", r.URL.Path, s.state.Status)
 
-	// Check if instance is running
+	// If instance is not running, start it
 	if s.state.Status != "RUNNING" {
 		log.Printf("Instance not running (status: %s), attempting to start", s.state.Status)
-		// Start instance if not running
 		if err := s.startInstance(r.Context()); err != nil {
 			log.Printf("Failed to start instance: %v", err)
 			http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		// Set retry header for 503 responses
 		w.Header().Set(RetryHeaderName, RetryHeaderValue)
 		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
 		return
 	}
 
-	log.Printf("Instance is running (IP: %s), forwarding request", s.state.IP)
+	// If instance is running but not ready (within grace period), return 503
+	// Use strictly greater than comparison for more predictable test behavior
+	if !s.clock.Now().After(s.state.ReadyTime) {
+		log.Printf("Instance not ready yet (ready at: %v)", s.state.ReadyTime)
+		w.Header().Set(RetryHeaderName, RetryHeaderValue)
+		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	log.Printf("Instance is running and ready (IP: %s), forwarding request", s.state.IP)
 
 	// Update last used time
 	s.state.LastUsed = s.clock.Now()
@@ -182,8 +193,21 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // startInstance starts the GCE instance
 func (s *Server) startInstance(ctx context.Context) error {
+	// If instance is already starting, don't try to start it again
 	if s.state.Status == "STARTING" {
 		log.Printf("Instance already starting, waiting for it to become RUNNING")
+		return nil
+	}
+
+	// If instance is already running, don't try to start it again
+	if s.state.Status == "RUNNING" {
+		log.Printf("Instance already running, waiting for it to become ready")
+		// If ReadyTime is not set, set it to now + grace period
+		if s.state.ReadyTime.IsZero() {
+			s.state.ReadyTime = s.clock.Now().Add(StartupGracePeriod)
+			log.Printf("Instance %s is running but not ready yet (ready at: %v)",
+				s.cfg.InstanceName, s.state.ReadyTime)
+		}
 		return nil
 	}
 
@@ -193,7 +217,9 @@ func (s *Server) startInstance(ctx context.Context) error {
 
 	go func() {
 		log.Printf("Initiating instance start operation for %s", s.cfg.InstanceName)
-		if err := s.api.Start(ctx, s.cfg.ProjectID, s.cfg.DefaultZone, s.cfg.InstanceName); err != nil {
+		// Use background context for the long-running operation
+		bgCtx := context.Background()
+		if err := s.api.Start(bgCtx, s.cfg.ProjectID, s.cfg.DefaultZone, s.cfg.InstanceName); err != nil {
 			log.Printf("Failed to start instance %s: %v", s.cfg.InstanceName, err)
 			s.mu.Lock()
 			s.state.Status = "TERMINATED"
@@ -203,7 +229,7 @@ func (s *Server) startInstance(ctx context.Context) error {
 
 		log.Printf("Instance start operation completed, checking status and IP")
 		// Get instance IP
-		status, ip, err := s.api.Get(ctx, s.cfg.ProjectID, s.cfg.DefaultZone, s.cfg.InstanceName)
+		status, ip, err := s.api.Get(bgCtx, s.cfg.ProjectID, s.cfg.DefaultZone, s.cfg.InstanceName)
 		if err != nil {
 			log.Printf("Failed to get instance %s status: %v", s.cfg.InstanceName, err)
 			s.mu.Lock()
@@ -216,10 +242,18 @@ func (s *Server) startInstance(ctx context.Context) error {
 		oldStatus := s.state.Status
 		s.state.Status = status
 		s.state.IP = ip
+		// Set the ready time to be 60 seconds after the instance becomes RUNNING
+		if status == "RUNNING" {
+			s.state.ReadyTime = s.clock.Now().Add(StartupGracePeriod)
+			log.Printf("Instance %s is running but not ready yet (ready at: %v)",
+				s.cfg.InstanceName, s.state.ReadyTime)
+		}
+		// Reset last used time when instance starts
+		s.state.LastUsed = s.clock.Now()
 		s.mu.Unlock()
 
-		log.Printf("Instance %s state changed: %s -> %s (IP: %s)",
-			s.cfg.InstanceName, oldStatus, status, ip)
+		log.Printf("Instance %s state changed: %s -> %s (IP: %s, ready at: %v)",
+			s.cfg.InstanceName, oldStatus, status, ip, s.state.ReadyTime)
 
 		// Start idle timeout goroutine
 		go s.checkIdleTimeout()
@@ -241,6 +275,14 @@ func (s *Server) checkIdleTimeout() {
 			log.Printf("Instance not running, stopping idle timeout check")
 			return
 		}
+
+		// Only check idle time if we're past the startup grace period
+		// Use the same time comparison logic as ServeHTTP
+		if !s.clock.Now().After(s.state.ReadyTime) {
+			s.mu.RUnlock()
+			continue
+		}
+
 		idle := s.clock.Since(s.state.LastUsed)
 		s.mu.RUnlock()
 

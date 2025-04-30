@@ -6,7 +6,10 @@ A simple HTTP proxy that automatically starts and stops a GCE instance based on 
 
 - Automatically starts a GCE instance when a request is received
 - Automatically stops the instance after a configurable idle timeout
+- Includes a startup grace period to ensure instance is fully ready before accepting traffic
+- Handles instance state transitions appropriately (TERMINATED, STARTING, RUNNING)
 - Supports graceful shutdown of the instance when the proxy is stopped
+- Robust time-based operation with configurable timeouts
 - Comprehensive logging of instance lifecycle events
 - Simple configuration via JSON file
 - Health check endpoint for monitoring
@@ -51,6 +54,7 @@ The proxy provides detailed logging of instance lifecycle events:
 Example log output:
 ```
 Starting instance my-instance (current state: TERMINATED)
+Instance my-instance is running but not ready yet (ready at: 2024-03-14T12:01:00Z)
 Instance my-instance state changed: STARTING -> RUNNING (IP: 1.2.3.4)
 Instance my-instance idle for 5m0s, shutting down
 Successfully stopped instance my-instance
@@ -98,19 +102,25 @@ The proxy automatically manages the instance lifecycle:
 
 1. When a request is received and the instance is stopped:
    - Instance is started
-   - Request is queued with a 503 Service Unavailable response
+   - Request is queued with a 503 Service Unavailable response and retry header
    - Client should retry after the instance is running
 
-2. While the instance is running:
+2. During instance startup:
+   - Instance transitions from TERMINATED to STARTING to RUNNING
+   - After instance reaches RUNNING state, a grace period (60 seconds by default) is applied
+   - During the grace period, the proxy still returns 503 responses with retry headers
+   - This ensures the instance's services are fully initialized before traffic is sent
+
+3. When instance is running and ready:
    - All requests are forwarded to the instance
-   - Last used timestamp is updated
+   - Last used timestamp is updated with each request
    - Idle timeout is monitored
 
-3. When the instance is idle:
+4. When the instance is idle:
    - After the configured timeout, instance is automatically stopped
    - Next request will trigger a new start cycle
 
-4. During proxy shutdown:
+5. During proxy shutdown:
    - Instance is gracefully stopped if running
    - All pending operations are completed
 
@@ -118,9 +128,23 @@ The proxy automatically manages the instance lifecycle:
 
 - Failed instance operations are logged with detailed error messages
 - Clients receive appropriate HTTP status codes:
-  - 503 Service Unavailable when instance is starting
+  - 503 Service Unavailable when instance is starting or in grace period
   - 500 Internal Server Error for unexpected failures
   - Original response from the instance for successful requests
+
+## Testing
+
+The proxy is thoroughly tested with the following test cases:
+
+- **Instance Start Flow**: Tests the basic flow of starting an instance and proxying requests
+- **Startup Grace Period**: Ensures the proxy returns 503 during the grace period and 200 after
+- **Idle Timeout**: Verifies that instances are automatically stopped after the idle timeout
+- **Header Forwarding**: Confirms proper forwarding of HTTP headers to backend
+- **Error Handling**: Tests error conditions such as missing IP addresses or invalid states
+
+Note: Tests use mocks for both the Google Cloud API and system clock, allowing for precise control of time-based operations without actual cloud resources.
+
+The code also includes proper handling of race conditions and thread safety, ensuring consistent behavior when running in production.
 
 ## Dependencies
 

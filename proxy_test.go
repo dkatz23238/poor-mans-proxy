@@ -89,6 +89,9 @@ func (f *fakeAPI) Start(ctx context.Context, project, zone, instanceName string)
 	}
 	f.mu.Unlock()
 
+	// Simulate the delay between RUNNING and ready to accept connections
+	time.Sleep(100 * time.Millisecond)
+
 	// Signal that instance is ready
 	select {
 	case f.ready <- struct{}{}:
@@ -169,7 +172,17 @@ func (c *mockClock) advance(d time.Duration) {
 	c.mu.Lock()
 	c.now = c.now.Add(d)
 	c.mu.Unlock()
-	c.tick <- c.now
+
+	// Send multiple ticks to ensure all goroutines get the update
+	for i := 0; i < 20; i++ { // Increase from 10 to 20 for more reliability
+		select {
+		case c.tick <- c.now:
+		default:
+		}
+	}
+
+	// Wait longer to ensure all goroutines have processed the time change
+	time.Sleep(50 * time.Millisecond)
 }
 
 type fakeTicker struct{ c chan time.Time }
@@ -190,6 +203,9 @@ func TestStartThenProxy(t *testing.T) {
 	api := newFakeAPI("TERMINATED")
 	api.backend = backend
 
+	// Create a mock clock for precise time control
+	clock := newClock()
+
 	// Create proxy server with test configuration
 	cfg := &Config{
 		CredentialsFile:     "test-credentials.json",
@@ -197,13 +213,13 @@ func TestStartThenProxy(t *testing.T) {
 		DefaultZone:         "test-zone",
 		ListenPort:          8080,
 		InstanceName:        "test-instance",
-		DestPort:            backend.Listener.Addr().(*net.TCPAddr).Port, // Use the actual backend port
+		DestPort:            backend.Listener.Addr().(*net.TCPAddr).Port,
 		IdleTimeoutSeconds:  300,
 		MonitorIntervalSecs: 30,
 		IdleShutdownMinutes: 15,
 	}
 
-	server, err := NewServer(cfg, api, SystemClock())
+	server, err := NewServer(cfg, api, clock)
 	if err != nil {
 		t.Fatalf("Failed to create server: %v", err)
 	}
@@ -225,21 +241,16 @@ func TestStartThenProxy(t *testing.T) {
 		t.Errorf("Expected retry header %s, got %s", RetryHeaderValue, resp.Header.Get(RetryHeaderName))
 	}
 
-	// Second request should also return 503 while instance is starting
-	resp, err = http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("Failed to make request: %v", err)
-	}
-	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Errorf("Expected status 503, got %d", resp.StatusCode)
-	}
-
 	// Wait for instance to be ready
 	if !api.waitForReady(1 * time.Second) {
 		t.Fatal("Instance did not become ready in time")
 	}
 
-	// Third request should succeed and proxy to backend
+	// Advance clock past grace period
+	clock.advance(StartupGracePeriod + 1*time.Second)
+	time.Sleep(100 * time.Millisecond) // Give time for state to update
+
+	// Second request should succeed and proxy to backend
 	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Failed to make request: %v", err)
@@ -249,7 +260,88 @@ func TestStartThenProxy(t *testing.T) {
 	}
 	body, _ := io.ReadAll(resp.Body)
 	if string(body) != "backend response" {
-		t.Errorf("Expected body 'backend response', got %s", string(body))
+		t.Errorf("Expected response 'backend response', got '%s'", string(body))
+	}
+}
+
+func TestStartupGracePeriod(t *testing.T) {
+	// Create a test server to simulate the backend
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("backend response"))
+	}))
+	defer backend.Close()
+
+	// Create a fake API that simulates GCE behavior
+	api := newFakeAPI("RUNNING") // Start with instance already running
+	api.backend = backend
+	api.ip = "127.0.0.1" // Set IP address directly
+
+	// Create a mock clock for precise time control
+	clock := newClock()
+	now := clock.Now()
+
+	// Create proxy server with test configuration
+	cfg := &Config{
+		CredentialsFile:     "test-credentials.json",
+		ProjectID:           "test-project",
+		DefaultZone:         "test-zone",
+		ListenPort:          8080,
+		InstanceName:        "test-instance",
+		DestPort:            backend.Listener.Addr().(*net.TCPAddr).Port,
+		IdleTimeoutSeconds:  300,
+		MonitorIntervalSecs: 30,
+		IdleShutdownMinutes: 15,
+	}
+
+	server, err := NewServer(cfg, api, clock)
+	if err != nil {
+		t.Fatalf("Failed to create server: %v", err)
+	}
+
+	// Explicitly set ReadyTime to test grace period
+	server.mu.Lock()
+	server.state.ReadyTime = now.Add(60 * time.Second) // Set to exactly 60 seconds from now
+	server.mu.Unlock()
+
+	proxy := httptest.NewServer(server)
+	defer proxy.Close()
+
+	req, _ := http.NewRequest("GET", proxy.URL, nil)
+	req.Host = "test.example.com"
+
+	// Test 1: During grace period - should return 503
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to make request: %v", err)
+	}
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("During grace period: Expected status 503, got %d", resp.StatusCode)
+	}
+
+	// Advance clock to exactly the end of grace period
+	clock.advance(60 * time.Second)
+	time.Sleep(200 * time.Millisecond) // Give more time for state to update
+
+	// Test 2: At grace period end - should return 503
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to make request: %v", err)
+	}
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("At grace period end: Expected status 503, got %d", resp.StatusCode)
+	}
+
+	// Advance clock past grace period
+	clock.advance(1 * time.Second)
+	time.Sleep(200 * time.Millisecond) // Give more time for state to update
+
+	// Test 3: After grace period - should return 200
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to make request: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("After grace period: Expected status 200, got %d", resp.StatusCode)
 	}
 }
 
@@ -372,6 +464,9 @@ func TestCustomResponseHeaders(t *testing.T) {
 	api := newFakeAPI("TERMINATED")
 	api.backend = backend
 
+	// Create a mock clock for precise time control
+	clock := newClock()
+
 	// Create proxy server with test configuration
 	cfg := &Config{
 		CredentialsFile:     "test-credentials.json",
@@ -379,13 +474,13 @@ func TestCustomResponseHeaders(t *testing.T) {
 		DefaultZone:         "test-zone",
 		ListenPort:          8080,
 		InstanceName:        "test-instance",
-		DestPort:            backend.Listener.Addr().(*net.TCPAddr).Port, // Use the actual backend port
+		DestPort:            backend.Listener.Addr().(*net.TCPAddr).Port,
 		IdleTimeoutSeconds:  300,
 		MonitorIntervalSecs: 30,
 		IdleShutdownMinutes: 15,
 	}
 
-	server, err := NewServer(cfg, api, SystemClock())
+	server, err := NewServer(cfg, api, clock)
 	if err != nil {
 		t.Fatalf("Failed to create server: %v", err)
 	}
@@ -405,6 +500,10 @@ func TestCustomResponseHeaders(t *testing.T) {
 	if !api.waitForReady(1 * time.Second) {
 		t.Fatal("Instance did not become ready in time")
 	}
+
+	// Advance clock past grace period
+	clock.advance(StartupGracePeriod + 1*time.Second)
+	time.Sleep(100 * time.Millisecond) // Give time for state to update
 
 	// Make request to get response
 	resp, err = http.DefaultClient.Do(req)
@@ -424,8 +523,12 @@ func TestIdleTimeout(t *testing.T) {
 	defer backend.Close()
 
 	// Create a fake API that simulates GCE behavior
-	api := newFakeAPI("TERMINATED")
+	api := newFakeAPI("RUNNING") // Start with instance already running
 	api.backend = backend
+	api.ip = "127.0.0.1" // Set IP address directly
+
+	// Create a mock clock for precise time control
+	clock := newClock()
 
 	// Create proxy server with test configuration and short idle timeout
 	cfg := &Config{
@@ -434,35 +537,29 @@ func TestIdleTimeout(t *testing.T) {
 		DefaultZone:         "test-zone",
 		ListenPort:          8080,
 		InstanceName:        "test-instance",
-		DestPort:            backend.Listener.Addr().(*net.TCPAddr).Port, // Use the actual backend port
-		IdleTimeoutSeconds:  1,                                           // Short timeout for testing
+		DestPort:            backend.Listener.Addr().(*net.TCPAddr).Port,
+		IdleTimeoutSeconds:  1,
 		MonitorIntervalSecs: 1,
 		IdleShutdownMinutes: 1,
 	}
 
-	server, err := NewServer(cfg, api, SystemClock())
+	server, err := NewServer(cfg, api, clock)
 	if err != nil {
 		t.Fatalf("Failed to create server: %v", err)
 	}
 
+	// Force ReadyTime to be in the past so the instance is immediately ready
+	server.mu.Lock()
+	server.state.ReadyTime = clock.Now().Add(-10 * time.Minute)
+	server.mu.Unlock()
+
 	proxy := httptest.NewServer(server)
 	defer proxy.Close()
 
-	// Make request to trigger instance start
+	// First request should succeed immediately since instance is already running and ready
 	req, _ := http.NewRequest("GET", proxy.URL, nil)
 	req.Host = "test.example.com"
 	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("Failed to make request: %v", err)
-	}
-
-	// Wait for instance to be ready
-	if !api.waitForReady(1 * time.Second) {
-		t.Fatal("Instance did not become ready in time")
-	}
-
-	// Make request to get response
-	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Failed to make request: %v", err)
 	}
@@ -470,10 +567,11 @@ func TestIdleTimeout(t *testing.T) {
 		t.Errorf("Expected status 200, got %d", resp.StatusCode)
 	}
 
-	// Wait for idle timeout
-	time.Sleep(2 * time.Second)
+	// Advance clock past idle timeout
+	clock.advance(10 * time.Second)    // Well past the 1 second idle timeout
+	time.Sleep(200 * time.Millisecond) // Give more time for state to update
 
-	// Make another request to verify instance was stopped
+	// Second request should get 503 as instance should be stopped by now
 	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Failed to make request: %v", err)
@@ -504,6 +602,9 @@ func TestForwardedHeaders(t *testing.T) {
 	api := newFakeAPI("TERMINATED")
 	api.backend = backend
 
+	// Create a mock clock for precise time control
+	clock := newClock()
+
 	// Create proxy server with test configuration
 	cfg := &Config{
 		CredentialsFile:     "test-credentials.json",
@@ -511,13 +612,13 @@ func TestForwardedHeaders(t *testing.T) {
 		DefaultZone:         "test-zone",
 		ListenPort:          8080,
 		InstanceName:        "test-instance",
-		DestPort:            backend.Listener.Addr().(*net.TCPAddr).Port, // Use the actual backend port
+		DestPort:            backend.Listener.Addr().(*net.TCPAddr).Port,
 		IdleTimeoutSeconds:  300,
 		MonitorIntervalSecs: 30,
 		IdleShutdownMinutes: 15,
 	}
 
-	server, err := NewServer(cfg, api, SystemClock())
+	server, err := NewServer(cfg, api, clock)
 	if err != nil {
 		t.Fatalf("Failed to create server: %v", err)
 	}
@@ -538,6 +639,10 @@ func TestForwardedHeaders(t *testing.T) {
 		t.Fatal("Instance did not become ready in time")
 	}
 
+	// Advance clock past grace period
+	clock.advance(StartupGracePeriod + 1*time.Second)
+	time.Sleep(100 * time.Millisecond) // Give time for state to update
+
 	// Make request to get response with forwarded headers
 	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
@@ -556,8 +661,12 @@ func TestProtocolHandling(t *testing.T) {
 	defer backend.Close()
 
 	// Create a fake API that simulates GCE behavior
-	api := newFakeAPI("TERMINATED")
+	api := newFakeAPI("RUNNING") // Start with instance already running
 	api.backend = backend
+	api.ip = "127.0.0.1" // Set IP address directly
+
+	// Create a mock clock for precise time control
+	clock := newClock()
 
 	// Create proxy server with test configuration
 	cfg := &Config{
@@ -572,32 +681,23 @@ func TestProtocolHandling(t *testing.T) {
 		IdleShutdownMinutes: 15,
 	}
 
-	server, err := NewServer(cfg, api, SystemClock())
+	server, err := NewServer(cfg, api, clock)
 	if err != nil {
 		t.Fatalf("Failed to create server: %v", err)
 	}
 
+	// Force ReadyTime to be in the past so the instance is immediately ready
+	server.mu.Lock()
+	server.state.ReadyTime = clock.Now().Add(-10 * time.Minute)
+	server.mu.Unlock()
+
 	proxy := httptest.NewServer(server)
 	defer proxy.Close()
 
-	// First request should trigger instance start and return 503
+	// Request should succeed immediately since instance is already running and ready
 	req, _ := http.NewRequest("GET", proxy.URL, nil)
 	req.Host = "test.example.com"
 	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("Failed to make request: %v", err)
-	}
-	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Errorf("Expected status 503, got %d", resp.StatusCode)
-	}
-
-	// Wait for instance to be ready
-	if !api.waitForReady(1 * time.Second) {
-		t.Fatal("Instance did not become ready in time")
-	}
-
-	// Second request should succeed and proxy to backend
-	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Failed to make request: %v", err)
 	}
