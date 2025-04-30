@@ -22,11 +22,19 @@ func main() {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
+	// Verify credentials file exists
+	if _, err := os.Stat(cfg.CredentialsFile); err != nil {
+		log.Fatalf("Credentials file %s does not exist or is not accessible: %v", cfg.CredentialsFile, err)
+	}
+	log.Printf("Using credentials file: %s", cfg.CredentialsFile)
+
 	// Create GCE API client
+	log.Printf("Creating GCE client for project %s in zone %s", cfg.ProjectID, cfg.DefaultZone)
 	api, err := gce.NewClient(cfg.CredentialsFile, cfg.ProjectID, cfg.DefaultZone)
 	if err != nil {
 		log.Fatalf("Failed to create GCE client: %v", err)
 	}
+	log.Printf("Successfully created GCE client")
 
 	// Create proxy server
 	srv, err := proxy.NewServer(cfg, api, proxy.SystemClock())

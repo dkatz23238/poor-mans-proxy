@@ -3,6 +3,7 @@ package gce
 import (
 	"context"
 	"fmt"
+	"log"
 
 	compute "cloud.google.com/go/compute/apiv1"
 	computepb "cloud.google.com/go/compute/apiv1/computepb"
@@ -19,11 +20,13 @@ type Client struct {
 
 // NewClient creates a new GCE API client
 func NewClient(credentialsFile, projectID, defaultZone string) (api.GCEAPI, error) {
+	log.Printf("Initializing GCE client with credentials from %s", credentialsFile)
 	ctx := context.Background()
 	client, err := compute.NewInstancesRESTClient(ctx, option.WithCredentialsFile(credentialsFile))
 	if err != nil {
 		return nil, fmt.Errorf("creating GCE client: %w", err)
 	}
+	log.Printf("Successfully initialized GCE client for project %s in zone %s", projectID, defaultZone)
 
 	return &Client{
 		client:      client,

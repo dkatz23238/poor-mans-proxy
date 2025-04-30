@@ -136,10 +136,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	log.Printf("Received request for %s, instance state: %s", r.URL.Path, s.state.Status)
+
 	// Check if instance is running
 	if s.state.Status != "RUNNING" {
+		log.Printf("Instance not running (status: %s), attempting to start", s.state.Status)
 		// Start instance if not running
 		if err := s.startInstance(r.Context()); err != nil {
+			log.Printf("Failed to start instance: %v", err)
 			http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
 			return
 		}
@@ -148,6 +152,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
 		return
 	}
+
+	log.Printf("Instance is running (IP: %s), forwarding request", s.state.IP)
 
 	// Update last used time
 	s.state.LastUsed = s.clock.Now()
@@ -170,6 +176,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // startInstance starts the GCE instance
 func (s *Server) startInstance(ctx context.Context) error {
 	if s.state.Status == "STARTING" {
+		log.Printf("Instance already starting, waiting for it to become RUNNING")
 		return nil
 	}
 
@@ -178,6 +185,7 @@ func (s *Server) startInstance(ctx context.Context) error {
 	s.state.StartTime = s.clock.Now()
 
 	go func() {
+		log.Printf("Initiating instance start operation for %s", s.cfg.InstanceName)
 		if err := s.api.Start(ctx, s.cfg.ProjectID, s.cfg.DefaultZone, s.cfg.InstanceName); err != nil {
 			log.Printf("Failed to start instance %s: %v", s.cfg.InstanceName, err)
 			s.mu.Lock()
@@ -186,6 +194,7 @@ func (s *Server) startInstance(ctx context.Context) error {
 			return
 		}
 
+		log.Printf("Instance start operation completed, checking status and IP")
 		// Get instance IP
 		status, ip, err := s.api.Get(ctx, s.cfg.ProjectID, s.cfg.DefaultZone, s.cfg.InstanceName)
 		if err != nil {
