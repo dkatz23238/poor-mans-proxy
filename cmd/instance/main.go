@@ -7,6 +7,7 @@ import (
 
 	compute "cloud.google.com/go/compute/apiv1"
 	"example.com/proxy"
+	"google.golang.org/api/option"
 )
 
 func main() {
@@ -26,9 +27,9 @@ func main() {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	// Create GCE client
+	// Create GCE client with credentials
 	ctx := context.Background()
-	client, err := compute.NewInstancesRESTClient(ctx)
+	client, err := compute.NewInstancesRESTClient(ctx, option.WithCredentialsFile(cfg.CredentialsFile))
 	if err != nil {
 		log.Fatalf("Failed to create GCE client: %v", err)
 	}
