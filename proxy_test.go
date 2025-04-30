@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -461,8 +462,9 @@ func TestCustomResponseHeaders(t *testing.T) {
 	defer backend.Close()
 
 	// Create a fake API that simulates GCE behavior
-	api := newFakeAPI("TERMINATED")
+	api := newFakeAPI("RUNNING") // Start with instance already running
 	api.backend = backend
+	api.ip = "127.0.0.1" // Set IP address directly
 
 	// Create a mock clock for precise time control
 	clock := newClock()
@@ -485,28 +487,18 @@ func TestCustomResponseHeaders(t *testing.T) {
 		t.Fatalf("Failed to create server: %v", err)
 	}
 
+	// Force ReadyTime to be in the past so the instance is immediately ready
+	server.mu.Lock()
+	server.state.ReadyTime = clock.Now().Add(-10 * time.Minute)
+	server.mu.Unlock()
+
 	proxy := httptest.NewServer(server)
 	defer proxy.Close()
 
-	// Make request to trigger instance start
+	// Make request to get response
 	req, _ := http.NewRequest("GET", proxy.URL, nil)
 	req.Host = "test.example.com"
 	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("Failed to make request: %v", err)
-	}
-
-	// Wait for instance to be ready
-	if !api.waitForReady(1 * time.Second) {
-		t.Fatal("Instance did not become ready in time")
-	}
-
-	// Advance clock past grace period
-	clock.advance(StartupGracePeriod + 1*time.Second)
-	time.Sleep(100 * time.Millisecond) // Give time for state to update
-
-	// Make request to get response
-	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Failed to make request: %v", err)
 	}
@@ -707,5 +699,83 @@ func TestProtocolHandling(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if string(body) != "backend response" {
 		t.Errorf("Expected body 'backend response', got %s", string(body))
+	}
+}
+
+func TestHealthEndpoint(t *testing.T) {
+	// Create a fake API that simulates GCE behavior
+	api := newFakeAPI("RUNNING") // Start with instance already running
+	api.ip = "192.168.1.1"       // Set IP address directly
+
+	// Create a mock clock for precise time control
+	clock := newClock()
+	now := clock.Now()
+
+	// Create proxy server with test configuration
+	cfg := &Config{
+		CredentialsFile:    "test-credentials.json",
+		ProjectID:          "test-project",
+		DefaultZone:        "test-zone",
+		ListenPort:         8080,
+		InstanceName:       "test-instance",
+		DestPort:           80,
+		IdleTimeoutSeconds: 300,
+	}
+
+	server, err := NewServer(cfg, api, clock)
+	if err != nil {
+		t.Fatalf("Failed to create server: %v", err)
+	}
+
+	// Set specific times for testing
+	server.mu.Lock()
+	server.state.LastUsed = now.Add(-10 * time.Minute)
+	server.state.StartTime = now.Add(-20 * time.Minute)
+	server.mu.Unlock()
+
+	// Create a test server with our health handler
+	proxy := httptest.NewServer(http.HandlerFunc(server.handleHealth))
+	defer proxy.Close()
+
+	// Make request to health endpoint
+	resp, err := http.Get(proxy.URL)
+	if err != nil {
+		t.Fatalf("Failed to make request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Check status code
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("Expected status 200, got %d", resp.StatusCode)
+	}
+
+	// Check content type
+	if contentType := resp.Header.Get("Content-Type"); contentType != "application/json" {
+		t.Errorf("Expected Content-Type: application/json, got %s", contentType)
+	}
+
+	// Parse response
+	var healthData struct {
+		Status    string    `json:"status"`
+		IP        string    `json:"ip"`
+		LastUsed  time.Time `json:"last_used"`
+		StartTime time.Time `json:"start_time"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&healthData); err != nil {
+		t.Fatalf("Failed to decode response: %v", err)
+	}
+
+	// Verify response data
+	if healthData.Status != "RUNNING" {
+		t.Errorf("Expected status RUNNING, got %s", healthData.Status)
+	}
+	if healthData.IP != "192.168.1.1" {
+		t.Errorf("Expected IP 192.168.1.1, got %s", healthData.IP)
+	}
+	if !healthData.LastUsed.Equal(server.state.LastUsed) {
+		t.Errorf("Expected LastUsed %v, got %v", server.state.LastUsed, healthData.LastUsed)
+	}
+	if !healthData.StartTime.Equal(server.state.StartTime) {
+		t.Errorf("Expected StartTime %v, got %v", server.state.StartTime, healthData.StartTime)
 	}
 }

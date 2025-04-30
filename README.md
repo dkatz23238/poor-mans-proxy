@@ -13,6 +13,7 @@ A simple HTTP proxy that automatically starts and stops a GCE instance based on 
 - Comprehensive logging of instance lifecycle events
 - Simple configuration via JSON file
 - Health check endpoint for monitoring
+- Queries instance status on startup to handle pre-existing instances
 
 ## Configuration
 
@@ -53,6 +54,7 @@ The proxy provides detailed logging of instance lifecycle events:
 
 Example log output:
 ```
+Initial state of instance my-instance: RUNNING (IP: 1.2.3.4)
 Starting instance my-instance (current state: TERMINATED)
 Instance my-instance is running but not ready yet (ready at: 2024-03-14T12:01:00Z)
 Instance my-instance state changed: STARTING -> RUNNING (IP: 1.2.3.4)
@@ -96,31 +98,38 @@ Possible status values:
 - `STARTING`: Instance is in the process of starting
 - `RUNNING`: Instance is running and ready to handle requests
 
+**Note**: The `/health` endpoint is handled directly by the proxy and does not forward requests to the backend server. All other requests are forwarded to the backend instance.
+
 ## Instance Management
 
 The proxy automatically manages the instance lifecycle:
 
-1. When a request is received and the instance is stopped:
+1. On startup:
+   - Queries Google Cloud API to determine the current state of the instance
+   - If the instance is already running, the proxy will immediately start monitoring idle timeout
+   - If the instance is stopped, the proxy will wait for incoming requests to start it
+
+2. When a request is received and the instance is stopped:
    - Instance is started
    - Request is queued with a 503 Service Unavailable response and retry header
    - Client should retry after the instance is running
 
-2. During instance startup:
+3. During instance startup:
    - Instance transitions from TERMINATED to STARTING to RUNNING
    - After instance reaches RUNNING state, a grace period (60 seconds by default) is applied
    - During the grace period, the proxy still returns 503 responses with retry headers
    - This ensures the instance's services are fully initialized before traffic is sent
 
-3. When instance is running and ready:
+4. When instance is running and ready:
    - All requests are forwarded to the instance
    - Last used timestamp is updated with each request
    - Idle timeout is monitored
 
-4. When the instance is idle:
+5. When the instance is idle:
    - After the configured timeout, instance is automatically stopped
    - Next request will trigger a new start cycle
 
-5. During proxy shutdown:
+6. During proxy shutdown:
    - Instance is gracefully stopped if running
    - All pending operations are completed
 

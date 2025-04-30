@@ -133,6 +133,7 @@ func NewServer(cfg *Config, api api.GCEAPI, clock Clock) (*Server, error) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", srv.ServeHTTP)
+	mux.HandleFunc("/health", srv.handleHealth)
 
 	srv.Server = &http.Server{
 		Addr:    fmt.Sprintf(":%d", cfg.ListenPort),
@@ -332,4 +333,29 @@ func (s *Server) ListenAndServeTLS(certFile, keyFile string) error {
 // Close implements io.Closer
 func (s *Server) Close() error {
 	return s.Server.Close()
+}
+
+// handleHealth implements the health check endpoint
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	resp := struct {
+		Status    string    `json:"status"`
+		IP        string    `json:"ip,omitempty"`
+		LastUsed  time.Time `json:"last_used,omitempty"`
+		StartTime time.Time `json:"start_time,omitempty"`
+	}{
+		Status:    s.state.Status,
+		IP:        s.state.IP,
+		LastUsed:  s.state.LastUsed,
+		StartTime: s.state.StartTime,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		log.Printf("Failed to encode health response: %v", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
 }
