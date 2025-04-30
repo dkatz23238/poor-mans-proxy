@@ -254,15 +254,14 @@ func (s *Server) checkIdleTimeout() {
 // Shutdown gracefully shuts down the server
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Just log the instance state, don't stop it
 	if s.state.Status == "RUNNING" {
-		log.Printf("Shutting down instance %s", s.cfg.InstanceName)
-		if err := s.api.Stop(ctx, s.cfg.ProjectID, s.cfg.DefaultZone, s.cfg.InstanceName); err != nil {
-			log.Printf("Failed to stop instance %s during shutdown: %v", s.cfg.InstanceName, err)
-		} else {
-			log.Printf("Successfully stopped instance %s during shutdown", s.cfg.InstanceName)
-		}
+		log.Printf("Proxy shutting down, instance %s is still running (IP: %s)",
+			s.cfg.InstanceName, s.state.IP)
 	}
-	s.mu.Unlock()
+
 	return s.Server.Shutdown(ctx)
 }
 
