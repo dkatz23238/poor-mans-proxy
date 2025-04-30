@@ -1,143 +1,129 @@
 # Poor Man's Proxy
 
-A lightweight HTTP proxy service that automatically manages GCP instances based on traffic. It starts instances when needed and shuts them down when idle, helping to reduce costs while maintaining service availability.
+A simple HTTP proxy that automatically starts and stops a GCE instance based on demand.
 
 ## Features
 
-- **Automatic Instance Management**
-  - Starts backend instances on first request
-  - Shuts down instances after period of inactivity
-  - Handles concurrent requests during instance startup
-
-- **Smart Request Handling**
-  - Returns 503 with retry header while instance is starting
-  - Forwards requests to backend once instance is ready
-  - Preserves original request headers and adds proxy headers
-
-- **Configurable Timeouts**
-  - Idle timeout for instance shutdown
-  - Monitoring interval for instance state
-  - Configurable shutdown delay
+- Automatically starts a GCE instance when a request is received
+- Automatically stops the instance after a configurable idle timeout
+- Supports graceful shutdown of the instance when the proxy is stopped
+- Comprehensive logging of instance lifecycle events
+- Simple configuration via JSON file
+- Health check endpoint for monitoring
 
 ## Configuration
 
-Create a `config.json` file with the following settings:
+Create a `config.json` file with the following structure:
 
 ```json
 {
-    "credentials_file": "path/to/service-account.json",
-    "project_id": "your-gcp-project",
+    "credentials_file": "path/to/credentials.json",
+    "project_id": "your-project-id",
     "default_zone": "us-central1-a",
     "listen_port": 8080,
-    "instance_name": "your-backend-instance",
-    "instance_port": 80,
+    "instance_name": "your-instance-name",
     "idle_timeout_seconds": 300,
-    "monitor_interval_secs": 30,
-    "idle_shutdown_minutes": 15
+    "dest_port": 80
 }
 ```
 
 ### Configuration Options
 
-- `credentials_file`: Path to GCP service account key file
+- `credentials_file`: Path to your GCP service account credentials JSON file
 - `project_id`: Your GCP project ID
-- `default_zone`: GCP zone where instances are located
-- `listen_port`: Port for the proxy to listen on
-- `instance_name`: Name of the backend instance to manage
-- `instance_port`: Port the backend instance listens on
-- `idle_timeout_seconds`: Time before considering instance idle
-- `monitor_interval_secs`: How often to check instance state
-- `idle_shutdown_minutes`: Minutes to wait before shutting down idle instance
+- `default_zone`: The GCP zone where your instance is located
+- `listen_port`: Port on which the proxy will listen for incoming requests
+- `instance_name`: Name of the GCE instance to manage
+- `idle_timeout_seconds`: Number of seconds of inactivity before stopping the instance
+- `dest_port`: Port on the instance to forward requests to
 
-## Codebase Structure
+## Logging
 
+The proxy provides detailed logging of instance lifecycle events:
+
+- Instance start attempts and current state
+- Instance status changes (including IP address)
+- Instance idle timeout detection and shutdown
+- Instance stop operations (both manual and automatic)
+- Graceful shutdown operations
+- Error conditions and failures
+
+Example log output:
 ```
-.
-├── cmd/
-│   └── proxyd/
-│       └── main.go         # Main entry point
-├── proxy/
-│   ├── proxy.go           # Core proxy implementation
-│   ├── proxy_test.go      # Test suite
-│   └── api/
-│       └── gce.go         # GCP API client
-└── config.json            # Configuration file
+Starting instance my-instance (current state: TERMINATED)
+Instance my-instance state changed: STARTING -> RUNNING (IP: 1.2.3.4)
+Instance my-instance idle for 5m0s, shutting down
+Successfully stopped instance my-instance
 ```
 
-### Key Components
+## Building
 
-- **Server**: Main proxy server implementation
-  - Handles HTTP requests
-  - Manages instance lifecycle
-  - Implements request forwarding
-
-- **GCE API Client**: Google Cloud Engine interface
-  - Starts/stops instances
-  - Gets instance status and IP
-  - Handles GCP authentication
-
-- **Configuration**: Service settings
-  - Loaded from JSON file
-  - Validated at startup
-  - Used throughout the service
-
-## Building and Running
-
-1. Build the service:
-   ```bash
-   go build -o proxyd ./cmd/proxyd
-   ```
-
-2. Run with configuration:
-   ```bash
-   ./proxyd -config config.json
-   ```
-
-## Testing
-
-Run the test suite:
 ```bash
-go test ./...
+go build -o proxyd cmd/proxyd/main.go
 ```
 
-Tests cover:
-- Instance lifecycle management
-- Request handling
-- Configuration loading
-- Error handling
-- Header forwarding
-- Idle timeout behavior
+## Running
 
-## Deployment
+```bash
+./proxyd
+```
 
-1. Create a GCP service account with permissions:
-   - `compute.instances.start`
-   - `compute.instances.stop`
-   - `compute.instances.get`
+## API
 
-2. Deploy to a small VM in the same region as your backend
+### Health Check
 
-3. Configure the service with your settings
+```
+GET /health
+```
 
-4. Run as a system service for reliability
+Returns a JSON response with the current instance state:
 
-## Monitoring
+```json
+{
+    "status": "RUNNING",
+    "ip": "1.2.3.4",
+    "last_used": "2024-03-14T12:00:00Z",
+    "start_time": "2024-03-14T11:55:00Z"
+}
+```
 
-The service logs important events:
-- Instance state changes
-- Request handling
-- Errors and warnings
+Possible status values:
+- `TERMINATED`: Instance is stopped
+- `STARTING`: Instance is in the process of starting
+- `RUNNING`: Instance is running and ready to handle requests
 
-Use standard logging tools to monitor the service.
+## Instance Management
 
-## Contributing
+The proxy automatically manages the instance lifecycle:
 
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Run tests
-5. Submit a pull request
+1. When a request is received and the instance is stopped:
+   - Instance is started
+   - Request is queued with a 503 Service Unavailable response
+   - Client should retry after the instance is running
 
-## License
+2. While the instance is running:
+   - All requests are forwarded to the instance
+   - Last used timestamp is updated
+   - Idle timeout is monitored
 
-MIT License - See LICENSE file for details 
+3. When the instance is idle:
+   - After the configured timeout, instance is automatically stopped
+   - Next request will trigger a new start cycle
+
+4. During proxy shutdown:
+   - Instance is gracefully stopped if running
+   - All pending operations are completed
+
+## Error Handling
+
+- Failed instance operations are logged with detailed error messages
+- Clients receive appropriate HTTP status codes:
+  - 503 Service Unavailable when instance is starting
+  - 500 Internal Server Error for unexpected failures
+  - Original response from the instance for successful requests
+
+## Dependencies
+
+- Go 1.16 or later
+- Google Cloud SDK
+- GCP service account with appropriate permissions 

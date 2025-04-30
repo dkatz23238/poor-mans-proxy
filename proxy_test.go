@@ -196,7 +196,7 @@ func TestStartThenProxy(t *testing.T) {
 		DefaultZone:         "test-zone",
 		ListenPort:          8080,
 		InstanceName:        "test-instance",
-		InstancePort:        backend.Listener.Addr().(*net.TCPAddr).Port, // Use the actual backend port
+		DestPort:            backend.Listener.Addr().(*net.TCPAddr).Port, // Use the actual backend port
 		IdleTimeoutSeconds:  300,
 		MonitorIntervalSecs: 30,
 		IdleShutdownMinutes: 15,
@@ -255,7 +255,7 @@ func TestStartThenProxy(t *testing.T) {
 func TestWhitelistPaths(t *testing.T) {
 	cfg := &Config{
 		InstanceName: "vm",
-		InstancePort: 80,
+		DestPort:     80,
 		ProjectID:    "test-project",
 		DefaultZone:  "test-zone",
 	}
@@ -297,15 +297,15 @@ func TestLoadConfig(t *testing.T) {
 		t.Errorf("expected instance name sigma-server, got %s", cfg.InstanceName)
 	}
 
-	if cfg.InstancePort != 0 {
-		t.Errorf("expected instance port 0, got %d", cfg.InstancePort)
+	if cfg.DestPort != 0 {
+		t.Errorf("expected instance port 0, got %d", cfg.DestPort)
 	}
 }
 
 func TestInstanceErrorHandling(t *testing.T) {
 	cfg := &Config{
 		InstanceName: "vm",
-		InstancePort: 80,
+		DestPort:     80,
 		ProjectID:    "test-project",
 		DefaultZone:  "test-zone",
 	}
@@ -351,7 +351,7 @@ func TestCustomResponseHeaders(t *testing.T) {
 		DefaultZone:         "test-zone",
 		ListenPort:          8080,
 		InstanceName:        "test-instance",
-		InstancePort:        backend.Listener.Addr().(*net.TCPAddr).Port, // Use the actual backend port
+		DestPort:            backend.Listener.Addr().(*net.TCPAddr).Port, // Use the actual backend port
 		IdleTimeoutSeconds:  300,
 		MonitorIntervalSecs: 30,
 		IdleShutdownMinutes: 15,
@@ -406,7 +406,7 @@ func TestIdleTimeout(t *testing.T) {
 		DefaultZone:         "test-zone",
 		ListenPort:          8080,
 		InstanceName:        "test-instance",
-		InstancePort:        backend.Listener.Addr().(*net.TCPAddr).Port, // Use the actual backend port
+		DestPort:            backend.Listener.Addr().(*net.TCPAddr).Port, // Use the actual backend port
 		IdleTimeoutSeconds:  1,                                           // Short timeout for testing
 		MonitorIntervalSecs: 1,
 		IdleShutdownMinutes: 1,
@@ -483,7 +483,7 @@ func TestForwardedHeaders(t *testing.T) {
 		DefaultZone:         "test-zone",
 		ListenPort:          8080,
 		InstanceName:        "test-instance",
-		InstancePort:        backend.Listener.Addr().(*net.TCPAddr).Port, // Use the actual backend port
+		DestPort:            backend.Listener.Addr().(*net.TCPAddr).Port, // Use the actual backend port
 		IdleTimeoutSeconds:  300,
 		MonitorIntervalSecs: 30,
 		IdleShutdownMinutes: 15,
@@ -538,7 +538,7 @@ func TestProtocolHandling(t *testing.T) {
 		DefaultZone:         "test-zone",
 		ListenPort:          8080,
 		InstanceName:        "test-instance",
-		InstancePort:        backend.Listener.Addr().(*net.TCPAddr).Port,
+		DestPort:            backend.Listener.Addr().(*net.TCPAddr).Port,
 		IdleTimeoutSeconds:  300,
 		MonitorIntervalSecs: 30,
 		IdleShutdownMinutes: 15,

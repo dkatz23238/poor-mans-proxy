@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -57,6 +58,7 @@ type Config struct {
 	IdleTimeoutSeconds  int    `json:"idle_timeout_seconds"`
 	MonitorIntervalSecs int    `json:"monitor_interval_secs"`
 	IdleShutdownMinutes int    `json:"idle_shutdown_minutes"`
+	DestPort            int    `json:"dest_port"`
 }
 
 // LoadConfig loads the proxy configuration from a JSON file
@@ -108,6 +110,16 @@ func NewServer(cfg *Config, api api.GCEAPI, clock Clock) (*Server, error) {
 		},
 	}
 
+	// Check initial instance state
+	status, ip, err := api.Get(context.Background(), cfg.ProjectID, cfg.DefaultZone, cfg.InstanceName)
+	if err != nil {
+		log.Printf("Failed to get initial state of instance %s: %v", cfg.InstanceName, err)
+	} else {
+		log.Printf("Initial state of instance %s: %s (IP: %s)", cfg.InstanceName, status, ip)
+		srv.state.Status = status
+		srv.state.IP = ip
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", srv.ServeHTTP)
 
@@ -143,7 +155,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Create reverse proxy
 	target := &url.URL{
 		Scheme: "http",
-		Host:   fmt.Sprintf("%s:%d", s.state.IP, s.cfg.InstancePort),
+		Host:   fmt.Sprintf("%s:%d", s.state.IP, s.cfg.DestPort),
 	}
 	proxy := httputil.NewSingleHostReverseProxy(target)
 
@@ -161,11 +173,13 @@ func (s *Server) startInstance(ctx context.Context) error {
 		return nil
 	}
 
+	log.Printf("Starting instance %s (current state: %s)", s.cfg.InstanceName, s.state.Status)
 	s.state.Status = "STARTING"
 	s.state.StartTime = s.clock.Now()
 
 	go func() {
 		if err := s.api.Start(ctx, s.cfg.ProjectID, s.cfg.DefaultZone, s.cfg.InstanceName); err != nil {
+			log.Printf("Failed to start instance %s: %v", s.cfg.InstanceName, err)
 			s.mu.Lock()
 			s.state.Status = "TERMINATED"
 			s.mu.Unlock()
@@ -175,6 +189,7 @@ func (s *Server) startInstance(ctx context.Context) error {
 		// Get instance IP
 		status, ip, err := s.api.Get(ctx, s.cfg.ProjectID, s.cfg.DefaultZone, s.cfg.InstanceName)
 		if err != nil {
+			log.Printf("Failed to get instance %s status: %v", s.cfg.InstanceName, err)
 			s.mu.Lock()
 			s.state.Status = "TERMINATED"
 			s.mu.Unlock()
@@ -182,9 +197,13 @@ func (s *Server) startInstance(ctx context.Context) error {
 		}
 
 		s.mu.Lock()
+		oldStatus := s.state.Status
 		s.state.Status = status
 		s.state.IP = ip
 		s.mu.Unlock()
+
+		log.Printf("Instance %s state changed: %s -> %s (IP: %s)",
+			s.cfg.InstanceName, oldStatus, status, ip)
 
 		// Start idle timeout goroutine
 		go s.checkIdleTimeout()
@@ -208,8 +227,14 @@ func (s *Server) checkIdleTimeout() {
 		if idle > time.Duration(s.cfg.IdleTimeoutSeconds)*time.Second {
 			s.mu.Lock()
 			if s.state.Status == "RUNNING" {
+				log.Printf("Instance %s idle for %v, shutting down",
+					s.cfg.InstanceName, idle)
 				s.state.Status = "TERMINATED"
-				s.api.Stop(context.Background(), s.cfg.ProjectID, s.cfg.DefaultZone, s.cfg.InstanceName)
+				if err := s.api.Stop(context.Background(), s.cfg.ProjectID, s.cfg.DefaultZone, s.cfg.InstanceName); err != nil {
+					log.Printf("Failed to stop instance %s: %v", s.cfg.InstanceName, err)
+				} else {
+					log.Printf("Successfully stopped instance %s", s.cfg.InstanceName)
+				}
 			}
 			s.mu.Unlock()
 			return
@@ -221,7 +246,12 @@ func (s *Server) checkIdleTimeout() {
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.mu.Lock()
 	if s.state.Status == "RUNNING" {
-		s.api.Stop(ctx, s.cfg.ProjectID, s.cfg.DefaultZone, s.cfg.InstanceName)
+		log.Printf("Shutting down instance %s", s.cfg.InstanceName)
+		if err := s.api.Stop(ctx, s.cfg.ProjectID, s.cfg.DefaultZone, s.cfg.InstanceName); err != nil {
+			log.Printf("Failed to stop instance %s during shutdown: %v", s.cfg.InstanceName, err)
+		} else {
+			log.Printf("Successfully stopped instance %s during shutdown", s.cfg.InstanceName)
+		}
 	}
 	s.mu.Unlock()
 	return s.Server.Shutdown(ctx)
