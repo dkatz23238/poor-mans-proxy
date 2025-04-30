@@ -118,6 +118,13 @@ func NewServer(cfg *Config, api api.GCEAPI, clock Clock) (*Server, error) {
 		log.Printf("Initial state of instance %s: %s (IP: %s)", cfg.InstanceName, status, ip)
 		srv.state.Status = status
 		srv.state.IP = ip
+		srv.state.LastUsed = clock.Now()
+
+		// If instance is already running, start idle timeout check
+		if status == "RUNNING" {
+			log.Printf("Instance is already running, starting idle timeout check")
+			go srv.checkIdleTimeout()
+		}
 	}
 
 	mux := http.NewServeMux()
@@ -223,16 +230,21 @@ func (s *Server) startInstance(ctx context.Context) error {
 
 // checkIdleTimeout checks if the instance has been idle for too long
 func (s *Server) checkIdleTimeout() {
+	ticker := s.clock.NewTicker(time.Second)
+	defer ticker.Stop()
+
 	for {
-		time.Sleep(time.Second)
+		<-ticker.C()
 		s.mu.RLock()
 		if s.state.Status != "RUNNING" {
 			s.mu.RUnlock()
+			log.Printf("Instance not running, stopping idle timeout check")
 			return
 		}
 		idle := s.clock.Since(s.state.LastUsed)
 		s.mu.RUnlock()
 
+		log.Printf("Instance idle time: %v (timeout: %v)", idle, time.Duration(s.cfg.IdleTimeoutSeconds)*time.Second)
 		if idle > time.Duration(s.cfg.IdleTimeoutSeconds)*time.Second {
 			s.mu.Lock()
 			if s.state.Status == "RUNNING" {

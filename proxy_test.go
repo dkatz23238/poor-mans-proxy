@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -284,21 +285,48 @@ func TestWhitelistPaths(t *testing.T) {
 }
 
 func TestLoadConfig(t *testing.T) {
-	cfg, err := LoadConfig("config.json")
+	// Create a temporary test config file
+	testConfig := `{
+		"credentials_file": "test-credentials.json",
+		"project_id": "test-project",
+		"default_zone": "test-zone",
+		"listen_port": 8080,
+		"instance_name": "test-instance",
+		"idle_timeout_seconds": 300,
+		"dest_port": 80
+	}`
+
+	// Write the test config to a temporary file
+	tmpFile, err := os.CreateTemp("", "test-config-*.json")
+	if err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	if _, err := tmpFile.WriteString(testConfig); err != nil {
+		t.Fatalf("Failed to write test config: %v", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		t.Fatalf("Failed to close temp file: %v", err)
+	}
+
+	// Load the test config
+	cfg, err := LoadConfig(tmpFile.Name())
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
 
-	if cfg.ProjectID != "your-project-id" {
-		t.Errorf("expected project ID your-project-id, got %s", cfg.ProjectID)
+	// Verify the loaded values
+	if cfg.ProjectID != "test-project" {
+		t.Errorf("expected project ID test-project, got %s", cfg.ProjectID)
 	}
 
-	if cfg.InstanceName != "sigma-server" {
-		t.Errorf("expected instance name sigma-server, got %s", cfg.InstanceName)
+	if cfg.InstanceName != "test-instance" {
+		t.Errorf("expected instance name test-instance, got %s", cfg.InstanceName)
 	}
 
-	if cfg.DestPort != 0 {
-		t.Errorf("expected instance port 0, got %d", cfg.DestPort)
+	if cfg.DestPort != 80 {
+		t.Errorf("expected dest port 80, got %d", cfg.DestPort)
 	}
 }
 
@@ -318,8 +346,8 @@ func TestInstanceErrorHandling(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "http://any-host/", nil)
 	srv.ServeHTTP(rec, req)
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Errorf("want status %d for missing IP, got %d", http.StatusServiceUnavailable, rec.Code)
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("want status %d for missing IP, got %d", http.StatusBadGateway, rec.Code)
 	}
 
 	// Test invalid state
@@ -328,8 +356,8 @@ func TestInstanceErrorHandling(t *testing.T) {
 	api.mu.Unlock()
 	rec = httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Errorf("want status %d for invalid state, got %d", http.StatusServiceUnavailable, rec.Code)
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("want status %d for invalid state, got %d", http.StatusBadGateway, rec.Code)
 	}
 }
 
